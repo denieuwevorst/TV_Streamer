@@ -1,0 +1,33 @@
+
+[stream]
+
+; Uitvoermodus:
+; web    = alleen browserstream (HLS)
+; stream = alleen MPEG-TS (VLC/IPTV)
+; both   = beide tegelijkertijd
+output_mode = both
+
+; Map met videobestanden
+folder = ./videos
+
+; Netwerkinstellingen
+host = 0.0.0.0
+port = 8080
+
+; Videoresolutie
+width = 1280
+height = 720
+
+; Videokwaliteit
+video_bitrate = 2500k
+audio_bitrate = 128k
+fps = 25
+
+; FFmpeg encoder preset
+; ultrafast, veryfast, faster, fast, medium
+preset = veryfast
+
+; HLS-instellingen
+hls_time = 4
+hls_list_size = 8
+hls_dir = hls
