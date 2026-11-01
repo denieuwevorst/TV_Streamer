@@ -31,3 +31,9 @@ preset = veryfast
 hls_time = 4
 hls_list_size = 8
 hls_dir = hls
+
+; [logo]
+enabled = true
+file = ./logo.png
+width = 160
+margin = 20
