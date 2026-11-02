@@ -37,3 +37,10 @@ enabled = true
 file = ./logo.png
 width = 160
 margin = 20
+
+[web]
+page_title = DTV
+# none = alleen de vaste titel
+# filename = actuele bestandsnaam toevoegen
+# metadata = metadata-titel gebruiken, bestandsnaam als fallback
+current_title_mode = metadata
