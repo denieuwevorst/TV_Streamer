@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """TV Streamer v2 - MPEG-TS, HLS of beide."""
 
@@ -7,14 +6,17 @@ import html
 import json
 import logging
 import queue
+import random
 import re
 import shutil
 import subprocess
 import threading
 
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+from xml.etree import ElementTree as ET
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "settings.txt"
@@ -26,6 +28,34 @@ VIDEO_EXTENSIONS = {
 
 CHUNK_SIZE = 64 * 1024
 CLIENT_QUEUE_CHUNKS = 256
+
+
+def _norm(path):
+    """Uniforme padnotatie, zodat FFmpeg-logregels en bestanden matchen."""
+    return str(Path(path).resolve()).replace("\\", "/")
+
+
+def build_xmltv(settings, schedule):
+    fmt = "%Y%m%d%H%M%S +0000"
+    channel_id = settings["channel_id"]
+
+    tv = ET.Element("tv", {"generator-info-name": "tv_streamer"})
+    channel = ET.SubElement(tv, "channel", {"id": channel_id})
+    ET.SubElement(channel, "display-name").text = settings["page_title"]
+
+    for start, stop, title in schedule:
+        programme = ET.SubElement(tv, "programme", {
+            "start": start.strftime(fmt),
+            "stop": stop.strftime(fmt),
+            "channel": channel_id,
+        })
+        ET.SubElement(programme, "title", {"lang": "nl"}).text = title
+
+    return (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n'
+        + ET.tostring(tv, encoding="utf-8")
+    )
 
 
 def load_settings():
@@ -53,6 +83,11 @@ def load_settings():
     return {
         "page_title": web.get("page_title", "DTV").strip() or "DTV",
         "current_title_mode": title_mode,
+        "channel_id": re.sub(
+            r"[^A-Za-z0-9._-]", "",
+            web.get("channel_id", "dtv").strip()
+        ) or "dtv",
+        "epg_hours": max(1, int(web.get("epg_hours", "24"))),
         "folder": Path(
             s.get("folder", "./videos")
         ).expanduser().resolve(),
@@ -60,6 +95,7 @@ def load_settings():
         "host": s.get("host", "0.0.0.0"),
         "port": s.getint("port", 8080),
         "mode": mode,
+        "shuffle": s.getboolean("shuffle", False),
 
         "width": s.getint("width", 1280),
         "height": s.getint("height", 720),
@@ -86,7 +122,31 @@ def load_settings():
     }
 
 
-def make_concat_file(folder, playlist):
+SHUFFLE_ROUNDS = 50
+
+
+def build_sequence(files, shuffle):
+    """Afspeelvolgorde. Met shuffle: meerdere willekeurige rondes achter
+    elkaar, zodat iedere ronde een andere volgorde heeft."""
+    if not shuffle:
+        return list(files)
+
+    sequence = []
+
+    for _ in range(SHUFFLE_ROUNDS):
+        order = list(files)
+        random.shuffle(order)
+
+        # Voorkom dat hetzelfde bestand twee keer achter elkaar komt.
+        if sequence and len(order) > 1 and order[0] == sequence[-1]:
+            order[0], order[-1] = order[-1], order[0]
+
+        sequence.extend(order)
+
+    return sequence
+
+
+def make_concat_file(folder, playlist, shuffle=False):
     files = sorted(
         (
             p for p in folder.iterdir()
@@ -101,9 +161,11 @@ def make_concat_file(folder, playlist):
             f"Geen videobestanden gevonden in: {folder}"
         )
 
+    sequence = build_sequence(files, shuffle)
+
     lines = []
 
-    for path in files:
+    for path in sequence:
         value = str(path.resolve())
         value = value.replace("\\", "/")
         value = value.replace("'", "'\\''")
@@ -115,7 +177,7 @@ def make_concat_file(folder, playlist):
         encoding="utf-8"
     )
 
-    return files
+    return files, sequence
 
 
 class Broadcaster:
@@ -128,6 +190,13 @@ class Broadcaster:
         self.process = None
         self.current_file = ""
         self.current_label = ""
+        self.files = []
+        self.sequence = []
+        self.seq_keys = []
+        self.info = {}
+        self.info_ready = threading.Event()
+        self.anchor = None
+        self.started_at = datetime.now(timezone.utc)
 
     def subscribe(self):
         q = queue.Queue(
@@ -260,15 +329,29 @@ class Broadcaster:
         while not self.stop_event.is_set():
 
             try:
-                files = make_concat_file(
+                files, sequence = make_concat_file(
                     self.s["folder"],
-                    playlist
+                    playlist,
+                    self.s["shuffle"]
                 )
 
                 logging.info(
                     "%d videobestand(en) gevonden.",
                     len(files)
                 )
+
+                self.files = files
+                self.sequence = sequence
+                self.seq_keys = [_norm(p) for p in sequence]
+                self.anchor = None
+                self.started_at = datetime.now(timezone.utc)
+                self.info_ready.clear()
+
+                threading.Thread(
+                    target=self._scan_files,
+                    args=(files,),
+                    daemon=True
+                ).start()
 
                 self.s["hls_dir"].mkdir(
                     parents=True,
@@ -355,6 +438,67 @@ class Broadcaster:
 
             self.stop_event.wait(5)
 
+    def _locate(self, key):
+        """Zoek vanaf de laatst bekende positie vooruit (met wrap-around)
+        naar het bestand dat ffmpeg net opende."""
+        keys = self.seq_keys
+        n = len(keys)
+
+        if n == 0:
+            return None
+
+        start = self.anchor[0] if self.anchor else 0
+
+        for offset in range(n):
+            i = (start + offset) % n
+            if keys[i] == key:
+                return i
+
+        return None
+
+    def _duration_for_file(self, path):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True, timeout=30, check=False
+            )
+            return float(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    def _scan_files(self, files):
+        if not shutil.which("ffprobe"):
+            logging.warning(
+                "ffprobe niet gevonden; EPG (/epg.xml) is niet beschikbaar."
+            )
+
+        info = {}
+
+        for p in files:
+            if self.stop_event.is_set():
+                return
+
+            duration = self._duration_for_file(p) or 0.0
+            label = self._label_for_file(str(p))
+
+            if not label or label == p.name:
+                label = p.stem
+
+            info[_norm(p)] = (duration, label)
+
+        if self.files is files:
+            self.info = info
+            self.info_ready.set()
+            logging.info(
+                "EPG-gegevens ingelezen voor %d bestand(en).", len(info)
+            )
+
     def _label_for_file(self, filename):
         mode = self.s.get("current_title_mode", "metadata")
         if mode == "none":
@@ -399,10 +543,47 @@ class Broadcaster:
             match = pattern.search(line)
             if match:
                 self.current_file = match.group(1)
+                position = self._locate(_norm(match.group(1)))
+                if position is not None:
+                    self.anchor = (position, datetime.now(timezone.utc))
                 self.current_label = self._label_for_file(self.current_file)
                 logging.info("Nu afgespeeld: %s", Path(self.current_file).name)
             if line:
                 logging.info("FFmpeg: %s", line)
+
+    def build_schedule(self):
+        """Lijst van (start, stop, titel), gerekend vanaf het laatst
+        geopende bestand en de duur van alle bestanden daarna."""
+        if not self.info_ready.is_set() or not self.files:
+            return None
+
+        entries = [
+            self.info.get(_norm(p), (0.0, p.stem))
+            for p in self.sequence
+        ]
+
+        if sum(d for d, _ in entries) <= 0:
+            return None
+
+        index, start = self.anchor or (0, self.started_at)
+        end = (
+            datetime.now(timezone.utc)
+            + timedelta(hours=self.s["epg_hours"])
+        )
+
+        schedule = []
+
+        while start < end:
+            duration, label = entries[index]
+
+            if duration > 0:
+                stop = start + timedelta(seconds=duration)
+                schedule.append((start, stop, label))
+                start = stop
+
+            index = (index + 1) % len(entries)
+
+        return schedule
 
     def stop(self):
         self.stop_event.set()
@@ -432,59 +613,94 @@ class StreamHandler(BaseHTTPRequestHandler):
             js_title = json.dumps(page_title, ensure_ascii=False)
 
             if mode == "stream":
-                page = f"""<!doctype html>
-<html lang="nl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{safe_title}</title></head><body>
-<p>MPEG-TS stream: <a href="/tv">/tv</a></p>
-<script>
-const baseTitle = {js_title};
-async function updateTitle() {{
-  try {{
-    const response = await fetch('/status', {{cache: 'no-store'}});
-    if (!response.ok) return;
-    const status = await response.json();
-    document.title = status.label ? baseTitle + ' - ' + status.label : baseTitle;
-  }} catch (error) {{}}
-}}
-updateTitle(); setInterval(updateTitle, 2000);
-</script></body></html>"""
+                lib = '<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>'
+                start_js = """
+if (window.mpegts && mpegts.getFeatureList().mseLivePlayback) {
+  const p = mpegts.createPlayer({type: 'mpegts', isLive: true, url: '/tv'});
+  p.attachMediaElement(video);
+  p.load();
+  start();
+} else {
+  document.body.insertAdjacentHTML('beforeend',
+    '<p>Deze browser kan de stream niet afspelen. Open <a href="/tv">/tv</a> in VLC.</p>');
+}"""
             else:
-                page = f"""<!doctype html>
+                lib = '<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>'
+                start_js = """
+const src = '/hls/stream.m3u8';
+if (window.Hls && Hls.isSupported()) {
+  const h = new Hls({liveSyncDurationCount: 3});
+  h.loadSource(src);
+  h.attachMedia(video);
+  h.on(Hls.Events.MANIFEST_PARSED, start);
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+  video.src = src;
+  video.addEventListener('loadedmetadata', start);
+} else {
+  document.body.insertAdjacentHTML('beforeend', '<p>Deze browser ondersteunt HLS niet.</p>');
+}"""
+
+            page = """<!doctype html>
 <html lang="nl"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{safe_title}</title>
+<title>__TITLE__</title>
 <style>
-body {{ margin:0; background:#111; color:#eee; font:16px Arial;
-display:grid; place-items:center; min-height:100vh; }}
-main {{ width:min(960px,96vw); }}
-video {{ width:100%; background:#000; }}
+body { margin:0; background:#111; color:#eee; font:16px Arial;
+  display:grid; place-items:center; min-height:100vh; }
+main { width:min(960px,96vw); position:relative; }
+video { width:100%; background:#000; display:block; }
+#unmute { position:absolute; top:12px; right:12px; padding:10px 16px;
+  background:rgba(0,0,0,.75); color:#fff; border:1px solid #888;
+  border-radius:6px; font:inherit; cursor:pointer; display:none; }
 </style></head><body><main>
-<video id="player" controls autoplay playsinline></video>
+<video id="player" controls autoplay muted playsinline></video>
+<button id="unmute">🔇 Klik voor geluid</button>
 </main>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+__LIB__
 <script>
 const video = document.getElementById('player');
-const src = '/hls/stream.m3u8';
-const baseTitle = {js_title};
-async function updateTitle() {{
-  try {{
-    const response = await fetch('/status', {{cache: 'no-store'}});
+const unmuteBtn = document.getElementById('unmute');
+const baseTitle = __JSTITLE__;
+
+function refreshButton() {
+  unmuteBtn.style.display = (video.muted || video.paused) ? 'block' : 'none';
+  unmuteBtn.textContent = video.paused ? '▶ Klik om af te spelen' : '🔇 Klik voor geluid';
+}
+
+function start() {
+  video.muted = true;               // muted autoplay is always allowed
+  const p = video.play();
+  if (p) p.catch(refreshButton);
+  refreshButton();
+}
+
+unmuteBtn.addEventListener('click', () => {
+  video.muted = false;
+  video.play();
+  refreshButton();
+});
+video.addEventListener('volumechange', refreshButton);
+video.addEventListener('play', refreshButton);
+video.addEventListener('pause', refreshButton);
+
+async function updateTitle() {
+  try {
+    const response = await fetch('/status', {cache: 'no-store'});
     if (!response.ok) return;
     const status = await response.json();
     document.title = status.label ? baseTitle + ' - ' + status.label : baseTitle;
-  }} catch (error) {{}}
-}}
+  } catch (error) {}
+}
 updateTitle(); setInterval(updateTitle, 2000);
-if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-  video.src = src;
-}} else if (window.Hls && Hls.isSupported()) {{
-  const h = new Hls(); h.loadSource(src); h.attachMedia(video);
-}} else {{
-  video.outerHTML = '<p>Deze browser ondersteunt HLS niet.</p>';
-}}
+
+__START__
 </script></body></html>"""
+
+            page = (page.replace("__TITLE__", safe_title)
+                        .replace("__LIB__", lib)
+                        .replace("__JSTITLE__", js_title)
+                        .replace("__START__", start_js))
 
             body = page.encode("utf-8")
             self.send_response(200)
@@ -492,6 +708,47 @@ if (video.canPlayType('application/vnd.apple.mpegurl')) {{
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if self.path == "/playlist.m3u":
+            host = (
+                self.headers.get("Host")
+                or f"localhost:{self.settings['port']}"
+            )
+            base = f"http://{host}"
+            url = base + (
+                "/tv" if mode in {"stream", "both"}
+                else "/hls/stream.m3u8"
+            )
+            channel_id = self.settings["channel_id"]
+            name = self.settings["page_title"].replace('"', "'")
+
+            text = (
+                f'#EXTM3U x-tvg-url="{base}/epg.xml"\n'
+                f'#EXTINF:-1 tvg-id="{channel_id}" '
+                f'tvg-name="{name}" group-title="TV",{name}\n'
+                f"{url}\n"
+            )
+            self.send_bytes(
+                text.encode("utf-8"),
+                "audio/x-mpegurl; charset=utf-8"
+            )
+            return
+
+        if self.path == "/epg.xml":
+            schedule = self.broadcaster.build_schedule()
+
+            if schedule is None:
+                self.send_error(
+                    503,
+                    "EPG nog niet beschikbaar (ffprobe nodig)"
+                )
+                return
+
+            self.send_bytes(
+                build_xmltv(self.settings, schedule),
+                "application/xml; charset=utf-8"
+            )
             return
 
         if self.path == "/status":
@@ -532,6 +789,14 @@ if (video.canPlayType('application/vnd.apple.mpegurl')) {{
             return
 
         self.send_error(404)
+
+    def send_bytes(self, body, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def stream_mpegts(self):
 
@@ -734,6 +999,18 @@ def main():
             display_host,
             s["port"]
         )
+
+    logging.info(
+        "M3U-playlist: http://%s:%d/playlist.m3u",
+        display_host,
+        s["port"]
+    )
+
+    logging.info(
+        "XMLTV: http://%s:%d/epg.xml",
+        display_host,
+        s["port"]
+    )
 
     try:
         server.serve_forever()
