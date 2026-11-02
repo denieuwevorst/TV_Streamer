@@ -1,11 +1,13 @@
 
-[stream]
 #!/usr/bin/env python3
 """TV Streamer v2 - MPEG-TS, HLS of beide."""
 
 import configparser
+import html
+import json
 import logging
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -36,9 +38,12 @@ def load_settings():
 
     config.read(CONFIG_FILE, encoding="utf-8")
     s = config["stream"]
-    logo = config["logo"] if config.has_section("logo") else None
+    web = config["web"] if config.has_section("web") else {}
 
     mode = s.get("output_mode", "both").strip().lower()
+    title_mode = web.get("current_title_mode", "metadata").strip().lower()
+    if title_mode not in {"none", "filename", "metadata"}:
+        raise ValueError("current_title_mode moet none, filename of metadata zijn.")
 
     if mode not in {"web", "stream", "both"}:
         raise ValueError(
@@ -46,6 +51,8 @@ def load_settings():
         )
 
     return {
+        "page_title": web.get("page_title", "DTV").strip() or "DTV",
+        "current_title_mode": title_mode,
         "folder": Path(
             s.get("folder", "./videos")
         ).expanduser().resolve(),
@@ -76,14 +83,6 @@ def load_settings():
         "hls_dir": (
             BASE_DIR / s.get("hls_dir", "hls")
         ).resolve(),
-
-        # Logo-instellingen zijn optioneel; zonder [logo]-sectie staat het uit.
-        "logo_enabled": logo.getboolean("enabled", False) if logo else False,
-        "logo_file": (
-            BASE_DIR / logo.get("file", "./logo.png")
-        ).expanduser().resolve() if logo else (BASE_DIR / "logo.png"),
-        "logo_width": logo.getint("width", 160) if logo else 160,
-        "logo_margin": logo.getint("margin", 20) if logo else 20,
     }
 
 
@@ -127,6 +126,8 @@ class Broadcaster:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.process = None
+        self.current_file = ""
+        self.current_label = ""
 
     def subscribe(self):
         q = queue.Queue(
@@ -169,7 +170,7 @@ class Broadcaster:
         cmd = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "warning",
+            "-loglevel", "info",
 
             "-re",
             "-stream_loop", "-1",
@@ -177,43 +178,19 @@ class Broadcaster:
             "-f", "concat",
             "-safe", "0",
             "-i", str(playlist),
-        ]
 
-        if s["logo_enabled"]:
-            # Tweede input is een stilstaand beeld dat door -loop 1 blijft bestaan.
-            cmd += [
-                "-loop", "1",
-                "-i", str(s["logo_file"]),
-                "-filter_complex",
-                (
-                    f"[0:v]scale={s['width']}:{s['height']}:"
-                    "force_original_aspect_ratio=decrease,"
-                    f"pad={s['width']}:{s['height']}:"
-                    "(ow-iw)/2:(oh-ih)/2,"
-                    f"fps={s['fps']}[base];"
-                    f"[1:v]scale={s['logo_width']}:-1[logo];"
-                    f"[base][logo]overlay="
-                    f"W-w-{s['logo_margin']}:{s['logo_margin']}:"
-                    "format=auto[vout]"
-                ),
-                "-map", "[vout]",
-                "-map", "0:a:0?",
-            ]
-        else:
-            cmd += [
-                "-map", "0:v:0",
-                "-map", "0:a:0?",
-                "-vf",
-                (
-                    f"scale={s['width']}:{s['height']}:"
-                    "force_original_aspect_ratio=decrease,"
-                    f"pad={s['width']}:{s['height']}:"
-                    "(ow-iw)/2:(oh-ih)/2,"
-                    f"fps={s['fps']}"
-                ),
-            ]
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
 
-        cmd += [
+            "-vf",
+            (
+                f"scale={s['width']}:{s['height']}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={s['width']}:{s['height']}:"
+                "(ow-iw)/2:(oh-ih),"
+                f"fps={s['fps']}"
+            ),
+
             "-c:v", "libx264",
             "-preset", s["preset"],
             "-b:v", s["video_bitrate"],
@@ -378,16 +355,54 @@ class Broadcaster:
 
             self.stop_event.wait(5)
 
-    @staticmethod
-    def _log_ffmpeg(stderr):
-        for raw in iter(stderr.readline, b""):
-            line = raw.decode(
-                "utf-8",
-                errors="replace"
-            ).strip()
+    def _label_for_file(self, filename):
+        mode = self.s.get("current_title_mode", "metadata")
+        if mode == "none":
+            return ""
 
+        fallback = Path(filename).name
+        if mode == "filename":
+            return fallback
+
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            logging.warning("ffprobe niet gevonden; bestandsnaam wordt gebruikt.")
+            return fallback
+
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error",
+                 "-show_entries", "format_tags=title:stream_tags=title",
+                 "-of", "json", filename],
+                capture_output=True, text=True, timeout=10, check=False
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout or "{}")
+                title = data.get("format", {}).get("tags", {}).get("title")
+                if not title:
+                    for stream in data.get("streams", []):
+                        title = stream.get("tags", {}).get("title")
+                        if title:
+                            break
+                if title and str(title).strip():
+                    return str(title).strip()
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            logging.warning("Metadata uitlezen mislukt voor %s: %s", fallback, exc)
+
+        return fallback
+
+    def _log_ffmpeg(self, stderr):
+        # De concat-demuxer meldt ieder nieuw geopend videobestand op info-niveau.
+        pattern = re.compile(r"Opening ['\"](.+?)['\"] for reading")
+        for raw in iter(stderr.readline, b""):
+            line = raw.decode("utf-8", errors="replace").strip()
+            match = pattern.search(line)
+            if match:
+                self.current_file = match.group(1)
+                self.current_label = self._label_for_file(self.current_file)
+                logging.info("Nu afgespeeld: %s", Path(self.current_file).name)
             if line:
-                logging.warning("FFmpeg: %s", line)
+                logging.info("FFmpeg: %s", line)
 
     def stop(self):
         self.stop_event.set()
@@ -412,90 +427,84 @@ class StreamHandler(BaseHTTPRequestHandler):
 
         if self.path in ("/", "/index.html"):
 
+            page_title = self.settings.get("page_title", "DTV")
+            safe_title = html.escape(page_title)
+            js_title = json.dumps(page_title, ensure_ascii=False)
+
             if mode == "stream":
-
-                body = (
-                    "<html><body>"
-                    "<h2>TV Streamer</h2>"
-                    "<p>MPEG-TS stream: "
-                    "<a href='/tv'>/tv</a></p>"
-                    "</body></html>"
-                ).encode()
-
+                page = f"""<!doctype html>
+<html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{safe_title}</title></head><body>
+<p>MPEG-TS stream: <a href="/tv">/tv</a></p>
+<script>
+const baseTitle = {js_title};
+async function updateTitle() {{
+  try {{
+    const response = await fetch('/status', {{cache: 'no-store'}});
+    if (!response.ok) return;
+    const status = await response.json();
+    document.title = status.label ? baseTitle + ' - ' + status.label : baseTitle;
+  }} catch (error) {{}}
+}}
+updateTitle(); setInterval(updateTitle, 2000);
+</script></body></html>"""
             else:
-
-                body = b"""<!doctype html>
-<html lang="nl">
-<head>
+                page = f"""<!doctype html>
+<html lang="nl"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TV-zender</title>
+<title>{safe_title}</title>
 <style>
-body {
-    margin: 0;
-    background: #111;
-    color: #eee;
-    font: 16px Arial;
-    display: grid;
-    place-items: center;
-    min-height: 100vh;
-}
-main {
-    width: min(960px, 96vw);
-}
-video {
-    width: 100%;
-    background: #000;
-}
-h1 {
-    font-size: 1.4rem;
-}
-</style>
-</head>
-<body>
-<main>
-<h1>TV-zender</h1>
+body {{ margin:0; background:#111; color:#eee; font:16px Arial;
+display:grid; place-items:center; min-height:100vh; }}
+main {{ width:min(960px,96vw); }}
+video {{ width:100%; background:#000; }}
+</style></head><body><main>
 <video id="player" controls autoplay playsinline></video>
-<p>
-De uitzending speelt live.
-Nieuwe kijkers sluiten aan op het huidige moment.
-</p>
+</main>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const video = document.getElementById('player');
 const src = '/hls/stream.m3u8';
+const baseTitle = {js_title};
+async function updateTitle() {{
+  try {{
+    const response = await fetch('/status', {{cache: 'no-store'}});
+    if (!response.ok) return;
+    const status = await response.json();
+    document.title = status.label ? baseTitle + ' - ' + status.label : baseTitle;
+  }} catch (error) {{}}
+}}
+updateTitle(); setInterval(updateTitle, 2000);
+if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+  video.src = src;
+}} else if (window.Hls && Hls.isSupported()) {{
+  const h = new Hls(); h.loadSource(src); h.attachMedia(video);
+}} else {{
+  video.outerHTML = '<p>Deze browser ondersteunt HLS niet.</p>';
+}}
+</script></body></html>"""
 
-if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = src;
-}
-else if (window.Hls && Hls.isSupported()) {
-    const h = new Hls();
-    h.loadSource(src);
-    h.attachMedia(video);
-}
-else {
-    document.querySelector('p').textContent =
-        'Deze browser ondersteunt HLS niet.';
-}
-</script>
-</main>
-</body>
-</html>"""
-
+            body = page.encode("utf-8")
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if self.path == "/status":
+            payload = json.dumps(
+                {"label": self.broadcaster.current_label},
+                ensure_ascii=False
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
 
         if self.path == "/tv":
@@ -664,14 +673,6 @@ def main():
             f"Videomap bestaat niet: {s['folder']}"
         )
 
-    if s["logo_enabled"]:
-        if s["logo_file"].suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-            raise SystemExit("Logo moet een PNG- of JPG-bestand zijn.")
-        if not s["logo_file"].is_file():
-            raise SystemExit(f"Logobestand niet gevonden: {s['logo_file']}")
-        if s["logo_width"] < 1 or s["logo_margin"] < 0:
-            raise SystemExit("Logo-breedte moet positief zijn en marge mag niet negatief zijn.")
-
     if not 1 <= s["port"] <= 65535:
         raise SystemExit(
             "Poort moet tussen 1 en 65535 liggen."
@@ -748,23 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-; web, stream of both
-output_mode = both
-
-folder = ./videos
-
-host = 0.0.0.0
-port = 8080
-
-width = 1280
-height = 720
-
-video_bitrate = 2500k
-audio_bitrate = 128k
-fps = 25
-preset = veryfast
-
-hls_time = 4
-hls_list_size = 8
-hls_dir = hls
