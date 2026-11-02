@@ -32,6 +32,9 @@ hls_time = 4
 hls_list_size = 8
 hls_dir = hls
 
+; Shuffle instellen
+shuffle = true
+
 [logo]
 enabled = true
 file = ./logo.png
