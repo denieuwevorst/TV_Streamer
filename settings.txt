@@ -27,6 +27,14 @@ fps = 25
 ; ultrafast, veryfast, faster, fast, medium
 preset = veryfast
 
+; GPU-encoding:
+; none = CPU (libx264)
+; qsv  = Intel Quick Sync (h264_qsv)
+hwaccel = none
+
+; QSV preset: veryfast, faster, fast, medium, slow, slower, veryslow
+qsv_preset = veryfast
+
 ; HLS-instellingen
 hls_time = 4
 hls_list_size = 8
