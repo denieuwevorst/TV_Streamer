@@ -5,6 +5,7 @@ import configparser
 import html
 import json
 import logging
+import platform
 import queue
 import random
 import re
@@ -58,6 +59,29 @@ def build_xmltv(settings, schedule):
     )
 
 
+def prescale_logo(logo_file, width):
+    """Schaal het logo eenmalig, zodat dit niet per frame hoeft."""
+    out = BASE_DIR / "logo_scaled.png"
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(logo_file),
+                "-vf", f"scale={width}:-2",
+                "-frames:v", "1",
+                str(out),
+            ],
+            check=True,
+            timeout=30,
+        )
+        return out
+
+    except Exception:
+        logging.warning("Logo vooraf schalen mislukt; origineel gebruikt.")
+        return logo_file
+
+
 def load_settings():
     config = configparser.ConfigParser()
 
@@ -79,14 +103,19 @@ def load_settings():
         logging.warning("Logo niet gevonden: %s", logo_file)
         logo_enabled = False
 
+    logo_width = int(logo.get("width", "160"))
+    logo_overlay_file = logo_file
+    if logo_enabled:
+        logo_overlay_file = prescale_logo(logo_file, logo_width)
+
     mode = s.get("output_mode", "both").strip().lower()
     title_mode = web.get("current_title_mode", "metadata").strip().lower()
     if title_mode not in {"none", "filename", "metadata"}:
         raise ValueError("current_title_mode moet none, filename of metadata zijn.")
 
     hwaccel = s.get("hwaccel", "none").strip().lower()
-    if hwaccel not in {"none", "qsv"}:
-        raise ValueError("hwaccel moet none of qsv zijn.")
+    if hwaccel not in {"none", "qsv", "vaapi"}:
+        raise ValueError("hwaccel moet none, qsv of vaapi zijn.")
 
     if mode not in {"web", "stream", "both"}:
         raise ValueError(
@@ -96,7 +125,8 @@ def load_settings():
     return {
         "logo_enabled": logo_enabled,
         "logo_file": logo_file,
-        "logo_width": int(logo.get("width", "160")),
+        "logo_overlay_file": logo_overlay_file,
+        "logo_width": logo_width,
         "logo_margin": int(logo.get("margin", "20")),
         "page_title": web.get("page_title", "DTV").strip() or "DTV",
         "current_title_mode": title_mode,
@@ -128,7 +158,12 @@ def load_settings():
         "fps": s.getint("fps", 25),
         "preset": s.get("preset", "veryfast"),
         "hwaccel": hwaccel,
+        "gpu_filters": s.getboolean("gpu_filters", False),
         "qsv_preset": s.get("qsv_preset", "veryfast").strip(),
+        "qsv_device": s.get(
+            "qsv_device",
+            "" if platform.system() == "Windows" else "/dev/dri/renderD128"
+        ).strip(),
 
         "hls_time": s.getint("hls_time", 4),
         "hls_list_size": s.getint(
@@ -269,40 +304,112 @@ class Broadcaster:
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "info",
+        ]
 
+        if s["hwaccel"] == "vaapi":
+            cmd += [
+                "-init_hw_device", f"vaapi=va:{s['qsv_device']}",
+                "-filter_hw_device", "va",
+            ]
+        elif s["hwaccel"] == "qsv":
+            device = s["qsv_device"]
+            if device:
+                # Op Linux: QSV via VAAPI op het opgegeven render-device.
+                cmd += [
+                    "-init_hw_device", f"vaapi=va:{device}",
+                    "-init_hw_device", "qsv=hw@va",
+                ]
+            else:
+                cmd += ["-init_hw_device", "qsv=hw"]
+
+        gpu_chain = s["hwaccel"] == "vaapi" and s["gpu_filters"]
+
+        cmd += [
             "-re",
             "-stream_loop", "-1",
+        ]
 
+        if gpu_chain:
+            # Hardware-decode met automatische terugval op software;
+            # frames komen in systeemgeheugen en gaan daarna naar de GPU.
+            cmd += ["-hwaccel", "vaapi", "-hwaccel_device", "va"]
+
+        cmd += [
             "-f", "concat",
             "-safe", "0",
             "-i", str(playlist),
         ]
 
-        if s["logo_enabled"]:
+        if s["hwaccel"] == "vaapi":
+            tail = "format=nv12,hwupload"
+        else:
+            tail = "format=yuv420p"
+
+        w, h, fps = s["width"], s["height"], s["fps"]
+        center = "x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2"
+
+        if gpu_chain:
+            video = (
+                f"[0:v:0]setsar=1,fps={fps},format=nv12,hwupload,"
+                f"scale_vaapi=w={w}:h={h}:"
+                "force_original_aspect_ratio=decrease:"
+                "force_divisible_by=2[vid];"
+                f"color=c=black:s={w}x{h}:r={fps},"
+                "format=nv12,hwupload[bg];"
+            )
+
+            if s["logo_enabled"]:
+                m = s["logo_margin"]
+                cmd += [
+                    "-loop", "1",
+                    "-framerate", str(fps),
+                    "-i", s["logo_overlay_file"].as_posix(),
+                ]
+                graph = (
+                    video
+                    + f"[bg][vid]overlay_vaapi={center}[comp];"
+                    + "[1:v]format=rgba,hwupload[lg];"
+                    + f"[comp][lg]overlay_vaapi=x=main_w-overlay_w-{m}:"
+                    f"y={m}[v]"
+                )
+            else:
+                graph = video + f"[bg][vid]overlay_vaapi={center}[v]"
+
+            cmd += ["-filter_complex", graph, "-map", "[v]"]
+
+        elif s["logo_enabled"]:
             m = s["logo_margin"]
             cmd += [
                 "-loop", "1",
-                "-framerate", str(s["fps"]),
-                "-i", s["logo_file"].as_posix(),
+                "-framerate", str(fps),
+                "-i", s["logo_overlay_file"].as_posix(),
                 "-filter_complex",
                 (
                     f"[0:v:0]{base_filter}[bg];"
-                    f"[1:v]scale={s['logo_width']}:-2,format=rgba[lg];"
+                    "[1:v]format=rgba[lg];"
                     f"[bg][lg]overlay=x=main_w-overlay_w-{m}:y={m}:"
-                    "eof_action=repeat:format=auto,"
-                    "format=yuv420p[v]"
+                    f"eof_action=repeat:format=auto,{tail}[v]"
                 ),
                 "-map", "[v]",
             ]
         else:
-            cmd += ["-map", "0:v:0", "-vf", base_filter]
+            cmd += [
+                "-map", "0:v:0",
+                "-vf", f"{base_filter},{tail}"
+                if s["hwaccel"] == "vaapi" else base_filter,
+            ]
 
         cmd += [
             "-map", "0:a:0?",
 
         ]
 
-        if s["hwaccel"] == "qsv":
+        if s["hwaccel"] == "vaapi":
+            cmd += [
+                "-c:v", "h264_vaapi",
+                "-b:v", s["video_bitrate"],
+            ]
+        elif s["hwaccel"] == "qsv":
             cmd += [
                 "-c:v", "h264_qsv",
                 "-preset", s["qsv_preset"],
