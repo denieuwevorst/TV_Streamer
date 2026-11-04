@@ -67,8 +67,28 @@ http://SERVER-IP:8080/hls/stream.m3u8
 MPEG-TS:
 http://SERVER-IP:8080/tv
 
-VIDEO'S
--------
+M3U-playlist (voor Home Assistant / IPTV):
+http://SERVER-IP:8080/playlist.m3u
+
+XMLTV (EPG):
+http://SERVER-IP:8080/epg.xml
+
+HOME ASSISTANT
+--------------
+Optie 1 - IPTV Simple / M3U-integratie:
+Gebruik http://SERVER-IP:8080/playlist.m3u als playlist en
+http://SERVER-IP:8080/epg.xml als EPG. Het logo wordt meegegeven.
+
+Optie 2 - Media player / Generic camera:
+Gebruik http://SERVER-IP:8080/hls/stream.m3u8 als stream-URL
+(bijv. in een media_player.play_media of Generic Camera
+met stream source).
+
+LOGO
+----
+Het logo (logo.png) wordt rechtsboven in de stream gelegd.
+Instellen via [logo] in settings.txt (enabled, file, width, margin).
+
 Ondersteunde bestandstypen:
 
 MP4

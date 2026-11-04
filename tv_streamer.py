@@ -69,11 +69,24 @@ def load_settings():
     config.read(CONFIG_FILE, encoding="utf-8")
     s = config["stream"]
     web = config["web"] if config.has_section("web") else {}
+    logo = config["logo"] if config.has_section("logo") else {}
+    logo_file = (BASE_DIR / logo.get("file", "./logo.png")).resolve()
+    logo_enabled = (
+        str(logo.get("enabled", "true")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if logo_enabled and not logo_file.is_file():
+        logging.warning("Logo niet gevonden: %s", logo_file)
+        logo_enabled = False
 
     mode = s.get("output_mode", "both").strip().lower()
     title_mode = web.get("current_title_mode", "metadata").strip().lower()
     if title_mode not in {"none", "filename", "metadata"}:
         raise ValueError("current_title_mode moet none, filename of metadata zijn.")
+
+    hwaccel = s.get("hwaccel", "none").strip().lower()
+    if hwaccel not in {"none", "qsv"}:
+        raise ValueError("hwaccel moet none of qsv zijn.")
 
     if mode not in {"web", "stream", "both"}:
         raise ValueError(
@@ -81,6 +94,10 @@ def load_settings():
         )
 
     return {
+        "logo_enabled": logo_enabled,
+        "logo_file": logo_file,
+        "logo_width": int(logo.get("width", "160")),
+        "logo_margin": int(logo.get("margin", "20")),
         "page_title": web.get("page_title", "DTV").strip() or "DTV",
         "current_title_mode": title_mode,
         "channel_id": re.sub(
@@ -110,6 +127,8 @@ def load_settings():
 
         "fps": s.getint("fps", 25),
         "preset": s.get("preset", "veryfast"),
+        "hwaccel": hwaccel,
+        "qsv_preset": s.get("qsv_preset", "veryfast").strip(),
 
         "hls_time": s.getint("hls_time", 4),
         "hls_list_size": s.getint(
@@ -236,6 +255,16 @@ class Broadcaster:
     def ffmpeg_command(self, playlist):
         s = self.s
 
+        base_filter = (
+            "setsar=1,"
+            f"scale={s['width']}:{s['height']}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={s['width']}:{s['height']}:"
+            "(ow-iw)/2:(oh-ih)/2:color=black,"
+            "setsar=1,"
+            f"fps={s['fps']}"
+        )
+
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -247,23 +276,48 @@ class Broadcaster:
             "-f", "concat",
             "-safe", "0",
             "-i", str(playlist),
+        ]
 
-            "-map", "0:v:0",
+        if s["logo_enabled"]:
+            m = s["logo_margin"]
+            cmd += [
+                "-loop", "1",
+                "-framerate", str(s["fps"]),
+                "-i", s["logo_file"].as_posix(),
+                "-filter_complex",
+                (
+                    f"[0:v:0]{base_filter}[bg];"
+                    f"[1:v]scale={s['logo_width']}:-2,format=rgba[lg];"
+                    f"[bg][lg]overlay=x=main_w-overlay_w-{m}:y={m}:"
+                    "eof_action=repeat:format=auto,"
+                    "format=yuv420p[v]"
+                ),
+                "-map", "[v]",
+            ]
+        else:
+            cmd += ["-map", "0:v:0", "-vf", base_filter]
+
+        cmd += [
             "-map", "0:a:0?",
 
-            "-vf",
-            (
-                f"scale={s['width']}:{s['height']}:"
-                "force_original_aspect_ratio=decrease,"
-                f"pad={s['width']}:{s['height']}:"
-                "(ow-iw)/2:(oh-ih),"
-                f"fps={s['fps']}"
-            ),
+        ]
 
-            "-c:v", "libx264",
-            "-preset", s["preset"],
-            "-b:v", s["video_bitrate"],
-            "-pix_fmt", "yuv420p",
+        if s["hwaccel"] == "qsv":
+            cmd += [
+                "-c:v", "h264_qsv",
+                "-preset", s["qsv_preset"],
+                "-b:v", s["video_bitrate"],
+                "-pix_fmt", "nv12",
+            ]
+        else:
+            cmd += [
+                "-c:v", "libx264",
+                "-preset", s["preset"],
+                "-b:v", s["video_bitrate"],
+                "-pix_fmt", "yuv420p",
+            ]
+
+        cmd += [
 
             "-c:a", "aac",
             "-b:a", s["audio_bitrate"],
@@ -723,15 +777,27 @@ __START__
             channel_id = self.settings["channel_id"]
             name = self.settings["page_title"].replace('"', "'")
 
+            logo_attr = (
+                f' tvg-logo="{base}/logo.png"'
+                if self.settings["logo_enabled"] else ""
+            )
+
             text = (
                 f'#EXTM3U x-tvg-url="{base}/epg.xml"\n'
                 f'#EXTINF:-1 tvg-id="{channel_id}" '
-                f'tvg-name="{name}" group-title="TV",{name}\n'
+                f'tvg-name="{name}"{logo_attr} group-title="TV",{name}\n'
                 f"{url}\n"
             )
             self.send_bytes(
                 text.encode("utf-8"),
                 "audio/x-mpegurl; charset=utf-8"
+            )
+            return
+
+        if self.path == "/logo.png" and self.settings["logo_enabled"]:
+            self.send_bytes(
+                self.settings["logo_file"].read_bytes(),
+                "image/png"
             )
             return
 
